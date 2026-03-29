@@ -1,107 +1,88 @@
-const express = require('express');
-const ytdl    = require('@distube/ytdl-core');
-const fs      = require('fs');
-const path    = require('path');
-const router  = express.Router();
+const express   = require('express');
+const { exec }  = require('child_process');
+const path      = require('path');
+const fs        = require('fs');
+const router    = express.Router();
 
-/* ── Load cookies ────────────────────────────────
-   cookies.json lives at /app/cookies.json in Docker
-   process.cwd() = /app  (always correct)
-─────────────────────────────────────────────── */
-function getAgent() {
-  try {
-    // Use process.cwd() so it works regardless of __dirname
-    const cookiePath = path.join(process.cwd(), 'cookies.json');
-    console.log('[COOKIES] Looking for cookies at:', cookiePath);
-    if (fs.existsSync(cookiePath)) {
-      const raw = fs.readFileSync(cookiePath, 'utf8');
-      const cookies = JSON.parse(raw);
-      if (Array.isArray(cookies) && cookies.length > 0) {
-        console.log(`[COOKIES] Loaded ${cookies.length} cookies ✅`);
-        return ytdl.createAgent(cookies);
-      } else {
-        console.warn('[COOKIES] cookies.json is empty or invalid');
+const COOKIES = path.join(process.cwd(), 'cookies.txt');
+
+function ytdlp(url, extraArgs = '') {
+  return new Promise((resolve, reject) => {
+    const hasCookies = fs.existsSync(COOKIES);
+    const cookieFlag = hasCookies ? `--cookies "${COOKIES}"` : '';
+    console.log('[COOKIES FILE EXISTS]', hasCookies);
+
+    const cmd = `yt-dlp ${cookieFlag} --no-playlist -j --no-warnings "${url}"`;
+    console.log('[CMD]', cmd);
+
+    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve(stdout.trim());
       }
-    } else {
-      console.warn('[COOKIES] cookies.json not found at', cookiePath);
-    }
-  } catch (e) {
-    console.error('[COOKIES] Error loading cookies:', e.message);
-  }
-  return undefined;
+    );
+  });
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return 'N/A';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  return `${m}:${String(s).padStart(2,'0')}`;
-}
-
-function getBestThumbnail(thumbnails) {
-  if (!thumbnails || thumbnails.length === 0) return '';
-  return thumbnails.reduce((best, t) => {
-    const area = (t.width || 0) * (t.height || 0);
-    return area > (best.width || 0) * (best.height || 0) ? t : best;
-  }).url;
-}
-
-function parseVideoFormats(formats) {
-  const QUALITIES = ['144p','240p','360p','480p','720p','1080p','1440p','2160p'];
-  const seen = new Set();
-  const result = [];
-  const all = [
-    ...formats.filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4').sort((a,b) => (b.bitrate||0)-(a.bitrate||0)),
-    ...formats.filter(f => f.hasVideo && !f.hasAudio && f.container === 'mp4').sort((a,b) => (b.bitrate||0)-(a.bitrate||0)),
-  ];
-  for (const fmt of all) {
-    const q = fmt.qualityLabel;
-    if (!q) continue;
-    const norm = q.replace(/[^0-9p]/g,'').replace(/(\d+p)\d*/,'$1');
-    if (!QUALITIES.includes(norm) || seen.has(norm)) continue;
-    seen.add(norm);
-    result.push({ quality: norm, itag: fmt.itag, hasAudio: fmt.hasAudio, hasVideo: fmt.hasVideo });
-  }
-  return result.sort((a,b) => parseInt(b.quality)-parseInt(a.quality));
+function fmtDuration(s) {
+  if (!s) return 'N/A';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+    : `${m}:${String(sec).padStart(2,'0')}`;
 }
 
 router.get('/', async (req, res) => {
   const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'Missing url parameter.' });
-  if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid YouTube URL.' });
+  if (!url) return res.status(400).json({ error: 'Missing url.' });
+  if (!/youtu(\.be|be\.com)/.test(url))
+    return res.status(400).json({ error: 'Invalid YouTube URL.' });
 
   try {
-    const agent = getAgent();
-    const opts  = agent ? { agent } : {};
-    console.log('[INFO] Fetching info, cookies loaded:', !!agent);
-    const info  = await ytdl.getInfo(url, opts);
-    const { videoDetails, formats } = info;
+    const raw  = await ytdlp(url);
+    const info = JSON.parse(raw);
 
-    const audioFormats = formats
-      .filter(f => f.hasAudio && !f.hasVideo)
-      .sort((a,b) => (b.audioBitrate||0)-(a.audioBitrate||0));
+    const QUALITIES = ['144p','240p','360p','480p','720p','1080p','1440p','2160p'];
+    const seen = new Set();
+    const videoFormats = [];
+
+    for (const fmt of (info.formats || [])) {
+      if (!fmt.height || !fmt.vcodec || fmt.vcodec === 'none') continue;
+      const q = `${fmt.height}p`;
+      if (!QUALITIES.includes(q) || seen.has(q)) continue;
+      seen.add(q);
+      videoFormats.push({
+        quality : q,
+        itag    : fmt.format_id,
+        hasAudio: fmt.acodec !== 'none',
+        hasVideo: true,
+      });
+    }
+    videoFormats.sort((a,b) => parseInt(b.quality) - parseInt(a.quality));
+
+    const thumbs = (info.thumbnails || []).filter(t => t.url);
+    const thumbnail = thumbs.length
+      ? thumbs.reduce((b,t) => (t.width||0)*(t.height||0) > (b.width||0)*(b.height||0) ? t : b, thumbs[0]).url
+      : `https://i.ytimg.com/vi/${info.id}/maxresdefault.jpg`;
 
     res.json({
-      videoId    : videoDetails.videoId,
-      title      : videoDetails.title,
-      channel    : videoDetails.author?.name || 'Unknown',
-      duration   : formatDuration(parseInt(videoDetails.lengthSeconds)),
-      durationSec: parseInt(videoDetails.lengthSeconds),
-      views      : parseInt(videoDetails.viewCount || 0).toLocaleString(),
-      thumbnail  : getBestThumbnail(videoDetails.thumbnails),
-      videoFormats: parseVideoFormats(formats),
-      audioItag  : audioFormats[0]?.itag,
+      videoId    : info.id,
+      title      : info.title,
+      channel    : info.uploader || info.channel || 'Unknown',
+      duration   : fmtDuration(info.duration),
+      durationSec: info.duration,
+      views      : (info.view_count || 0).toLocaleString(),
+      thumbnail,
+      videoFormats,
+      audioItag  : 'bestaudio',
     });
 
   } catch (err) {
     console.error('[INFO ERROR]', err.message);
-    if (err.message?.includes('private'))
-      return res.status(403).json({ error: 'This video is private.' });
-    if (err.message?.includes('429') || err.message?.includes('rate'))
-      return res.status(429).json({ error: 'YouTube blocked this request. Try refreshing your cookies.json file.' });
-    res.status(500).json({ error: 'Could not fetch video info: ' + err.message });
+    const msg = err.message || '';
+    if (msg.includes('Private'))    return res.status(403).json({ error: 'This video is private.' });
+    if (msg.includes('unavailable'))return res.status(404).json({ error: 'Video unavailable.' });
+    res.status(500).json({ error: 'Failed: ' + msg.substring(0, 300) });
   }
 });
 
