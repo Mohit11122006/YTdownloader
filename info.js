@@ -22,66 +22,109 @@ router.get('/', async (req, res) => {
 
   const hasCookies = fs.existsSync(COOKIES);
   const cookieFlag = hasCookies ? `--cookies "${COOKIES}"` : '';
-  console.log('[COOKIES EXISTS]', hasCookies);
+  console.log('[COOKIES EXISTS]', hasCookies, COOKIES);
 
-  // --no-check-formats  → skip format availability check (fixes "format not available" on -j)
-  // --no-playlist       → single video only
-  // -j                  → dump JSON metadata
-  const cmd = `yt-dlp ${cookieFlag} --no-playlist --no-check-formats --no-warnings -j "${url}"`;
+  // Use -f best to avoid any format-specific checks
+  // --skip-download + --print-json is most reliable for metadata only
+  const cmd = [
+    'yt-dlp',
+    cookieFlag,
+    '--no-playlist',
+    '--no-check-formats',
+    '--no-check-certificates',
+    '--extractor-args', '"youtube:skip=dash,hls"',
+    '--skip-download',
+    '--no-warnings',
+    '-f', '"best[ext=mp4]/best"',
+    '-j',
+    `"${url}"`,
+  ].filter(Boolean).join(' ');
+
   console.log('[INFO CMD]', cmd);
 
-  exec(cmd, { timeout: 40000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+  exec(cmd, { timeout: 45000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
-      console.error('[INFO ERROR]', stderr || err.message);
       const msg = (stderr || err.message || '');
-      if (msg.includes('Private'))     return res.status(403).json({ error: 'This video is private.' });
-      if (msg.includes('unavailable')) return res.status(404).json({ error: 'Video unavailable.' });
-      return res.status(500).json({ error: 'Failed: ' + msg.substring(0, 300) });
-    }
+      console.error('[INFO ERROR]', msg);
 
-    try {
-      const info = JSON.parse(stdout.trim());
+      // Try fallback without format filter
+      console.log('[RETRY] Trying without format filter...');
+      const fallbackCmd = [
+        'yt-dlp',
+        cookieFlag,
+        '--no-playlist',
+        '--no-check-formats',
+        '--no-check-certificates',
+        '--no-warnings',
+        '-j',
+        `"${url}"`,
+      ].filter(Boolean).join(' ');
 
-      const QUALITIES = ['144p','240p','360p','480p','720p','1080p','1440p','2160p'];
-      const seen = new Set();
-      const videoFormats = [];
-
-      for (const fmt of (info.formats || [])) {
-        if (!fmt.height || !fmt.vcodec || fmt.vcodec === 'none') continue;
-        const q = `${fmt.height}p`;
-        if (!QUALITIES.includes(q) || seen.has(q)) continue;
-        seen.add(q);
-        videoFormats.push({
-          quality : q,
-          itag    : fmt.format_id,
-          hasAudio: fmt.acodec !== 'none',
-          hasVideo: true,
-        });
-      }
-      videoFormats.sort((a,b) => parseInt(b.quality) - parseInt(a.quality));
-
-      const thumbs = (info.thumbnails || []).filter(t => t.url);
-      const thumbnail = thumbs.length
-        ? thumbs.reduce((b,t) => (t.width||0)*(t.height||0) > (b.width||0)*(b.height||0) ? t : b, thumbs[0]).url
-        : `https://i.ytimg.com/vi/${info.id}/maxresdefault.jpg`;
-
-      res.json({
-        videoId    : info.id,
-        title      : info.title,
-        channel    : info.uploader || info.channel || 'Unknown',
-        duration   : fmtDuration(info.duration),
-        durationSec: info.duration,
-        views      : (info.view_count || 0).toLocaleString(),
-        thumbnail,
-        videoFormats,
-        audioItag  : 'bestaudio',
+      exec(fallbackCmd, { timeout: 45000, maxBuffer: 10 * 1024 * 1024 }, (err2, stdout2, stderr2) => {
+        if (err2) {
+          const msg2 = (stderr2 || err2.message || '');
+          console.error('[FALLBACK ERROR]', msg2);
+          if (msg2.includes('Private'))     return res.status(403).json({ error: 'This video is private.' });
+          if (msg2.includes('unavailable')) return res.status(404).json({ error: 'Video unavailable.' });
+          return res.status(500).json({ error: 'Failed: ' + msg2.substring(0, 300) });
+        }
+        parseAndRespond(stdout2, res);
       });
-
-    } catch (parseErr) {
-      console.error('[PARSE ERROR]', parseErr.message);
-      res.status(500).json({ error: 'Failed to parse video data.' });
+      return;
     }
+    parseAndRespond(stdout, res);
   });
 });
+
+function parseAndRespond(stdout, res) {
+  try {
+    const info = JSON.parse(stdout.trim());
+
+    const QUALITIES = ['144p','240p','360p','480p','720p','1080p','1440p','2160p'];
+    const seen = new Set();
+    const videoFormats = [];
+
+    for (const fmt of (info.formats || [])) {
+      if (!fmt.height || !fmt.vcodec || fmt.vcodec === 'none') continue;
+      const q = `${fmt.height}p`;
+      if (!QUALITIES.includes(q) || seen.has(q)) continue;
+      seen.add(q);
+      videoFormats.push({
+        quality : q,
+        itag    : fmt.format_id,
+        hasAudio: fmt.acodec !== 'none',
+        hasVideo: true,
+      });
+    }
+
+    // If no formats parsed, add a generic "best" option
+    if (videoFormats.length === 0) {
+      videoFormats.push({ quality: 'Best', itag: 'bestvideo', hasAudio: false, hasVideo: true });
+    }
+
+    videoFormats.sort((a,b) => parseInt(b.quality) - parseInt(a.quality));
+
+    const thumbs = (info.thumbnails || []).filter(t => t.url);
+    const thumbnail = thumbs.length
+      ? thumbs.reduce((b,t) => (t.width||0)*(t.height||0) > (b.width||0)*(b.height||0) ? t : b, thumbs[0]).url
+      : `https://i.ytimg.com/vi/${info.id}/maxresdefault.jpg`;
+
+    res.json({
+      videoId    : info.id,
+      title      : info.title,
+      channel    : info.uploader || info.channel || 'Unknown',
+      duration   : fmtDuration(info.duration),
+      durationSec: info.duration,
+      views      : (info.view_count || 0).toLocaleString(),
+      thumbnail,
+      videoFormats,
+      audioItag  : 'bestaudio',
+    });
+
+  } catch (parseErr) {
+    console.error('[PARSE ERROR]', parseErr.message);
+    res.status(500).json({ error: 'Failed to parse video data.' });
+  }
+}
 
 module.exports = router;
