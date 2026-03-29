@@ -1,27 +1,25 @@
 FROM node:18-alpine
 
-# Install FFmpeg
-RUN apk add --no-cache ffmpeg python3 make g++
+RUN apk add --no-cache ffmpeg python3 py3-pip curl && \
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+         -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
-# Install dependencies
 COPY package.json ./
 RUN npm install --production
 
-# Copy backend files
 COPY server.js ./
 COPY info.js ./routes/info.js
 COPY download.js ./routes/download.js
 
-# Copy cookies (critical for YouTube auth)
-COPY cookies.json ./cookies.json
+# Copy cookies.txt directly (Netscape format — no conversion needed)
+COPY cookies.txt ./cookies.txt
 
-# Copy frontend
 COPY index.html /frontend/index.html
-COPY style.css /frontend/style.css
-COPY app.js /frontend/app.js
+COPY style.css  /frontend/style.css
+COPY app.js     /frontend/app.js
 
 EXPOSE 10000
-
 CMD ["node", "server.js"]
