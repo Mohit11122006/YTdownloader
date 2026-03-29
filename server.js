@@ -8,6 +8,7 @@
 const express      = require('express');
 const cors         = require('cors');
 const path         = require('path');
+const fs           = require('fs');
 const rateLimit    = require('express-rate-limit');
 
 const infoRouter     = require('./routes/info');
@@ -16,13 +17,21 @@ const downloadRouter = require('./routes/download');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+/* ─── Resolve frontend path ──────────────────────────
+   Locally:  ../frontend  (ytflow/frontend/)
+   Docker:   /frontend    (copied to root in Dockerfile)
+─────────────────────────────────────────────────── */
+const localFrontend  = path.join(__dirname, '../frontend');
+const dockerFrontend = '/frontend';
+const FRONTEND_PATH  = fs.existsSync(localFrontend) ? localFrontend : dockerFrontend;
+
 /* ─── Middleware ─────────────────────────────────── */
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve the frontend from /frontend
-app.use(express.static(path.join(__dirname, '../frontend')));
+// Serve the frontend statically
+app.use(express.static(FRONTEND_PATH));
 
 // Rate limiting – 30 requests per minute per IP
 const limiter = rateLimit({
@@ -41,10 +50,11 @@ app.get('/api/health', (_req, res) => res.json({ status: 'ok', time: new Date() 
 
 /* ─── SPA fallback ────────────────────────────────── */
 app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/index.html'));
+  res.sendFile(path.join(FRONTEND_PATH, 'index.html'));
 });
 
 /* ─── Start ───────────────────────────────────────── */
 app.listen(PORT, () => {
-  console.log(`\n🚀  YTFlow server running at http://localhost:${PORT}\n`);
+  console.log(`\n🚀  YTFlow server running at http://localhost:${PORT}`);
+  console.log(`📁  Serving frontend from: ${FRONTEND_PATH}\n`);
 });
