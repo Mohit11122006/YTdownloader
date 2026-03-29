@@ -1,15 +1,29 @@
 /**
  * GET /api/info?url=<youtubeUrl>
- * Returns video metadata: title, thumbnail, duration, channel, formats
+ * Returns video metadata with cookie-based auth to bypass 429
  */
 
 const express = require('express');
 const ytdl    = require('@distube/ytdl-core');
+const fs      = require('fs');
+const path    = require('path');
 const router  = express.Router();
 
-/* ── Helpers ─────────────────────────────────────── */
+/* ── Load cookies if available ───────────────────── */
+function getAgent() {
+  try {
+    const cookiePath = path.join(__dirname, 'cookies.json');
+    if (fs.existsSync(cookiePath)) {
+      const cookies = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+      return ytdl.createAgent(cookies);
+    }
+  } catch (e) {
+    console.warn('[COOKIES] Failed to load cookies.json:', e.message);
+  }
+  return undefined;
+}
 
-/** Convert seconds → "HH:MM:SS" or "MM:SS" */
+/* ── Helpers ─────────────────────────────────────── */
 function formatDuration(seconds) {
   if (!seconds) return 'N/A';
   const h = Math.floor(seconds / 3600);
@@ -19,7 +33,6 @@ function formatDuration(seconds) {
   return `${m}:${String(s).padStart(2,'0')}`;
 }
 
-/** Pick the best thumbnail (highest resolution) */
 function getBestThumbnail(thumbnails) {
   if (!thumbnails || thumbnails.length === 0) return '';
   return thumbnails.reduce((best, t) => {
@@ -28,18 +41,15 @@ function getBestThumbnail(thumbnails) {
   }).url;
 }
 
-/** Normalise available video formats into clean quality options */
 function parseVideoFormats(formats) {
   const QUALITIES = ['144p','240p','360p','480p','720p','1080p','1440p','2160p'];
   const seen = new Set();
   const result = [];
 
-  // Prefer formats that have both video+audio (progressive)
   const progressive = formats
     .filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4')
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
-  // Also include adaptive (video-only) for higher qualities
   const adaptive = formats
     .filter(f => f.hasVideo && !f.hasAudio && f.container === 'mp4')
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -49,7 +59,6 @@ function parseVideoFormats(formats) {
   for (const fmt of all) {
     const q = fmt.qualityLabel;
     if (!q) continue;
-    // Normalise: strip extra chars like "720p60" → "720p"
     const normalised = q.replace(/[^0-9p]/g, '').replace(/(\d+p)\d*/,'$1');
     if (!QUALITIES.includes(normalised)) continue;
     if (seen.has(normalised)) continue;
@@ -64,7 +73,6 @@ function parseVideoFormats(formats) {
     });
   }
 
-  // Sort by quality descending
   result.sort((a, b) => parseInt(b.quality) - parseInt(a.quality));
   return result;
 }
@@ -77,39 +85,33 @@ router.get('/', async (req, res) => {
   if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid YouTube URL.' });
 
   try {
-    const info = await ytdl.getInfo(url);
+    const agent = getAgent();
+    const info  = await ytdl.getInfo(url, agent ? { agent } : {});
     const { videoDetails, formats } = info;
 
     const videoFormats = parseVideoFormats(formats);
-
-    // Best audio format (highest abr)
     const audioFormats = formats
       .filter(f => f.hasAudio && !f.hasVideo)
       .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
 
-    const bestAudio = audioFormats[0];
-
     res.json({
-      videoId   : videoDetails.videoId,
-      title     : videoDetails.title,
-      channel   : videoDetails.author?.name || 'Unknown',
-      duration  : formatDuration(parseInt(videoDetails.lengthSeconds)),
+      videoId    : videoDetails.videoId,
+      title      : videoDetails.title,
+      channel    : videoDetails.author?.name || 'Unknown',
+      duration   : formatDuration(parseInt(videoDetails.lengthSeconds)),
       durationSec: parseInt(videoDetails.lengthSeconds),
-      views     : parseInt(videoDetails.viewCount || 0).toLocaleString(),
-      thumbnail : getBestThumbnail(videoDetails.thumbnails),
+      views      : parseInt(videoDetails.viewCount || 0).toLocaleString(),
+      thumbnail  : getBestThumbnail(videoDetails.thumbnails),
       videoFormats,
-      audioItag : bestAudio?.itag,
+      audioItag  : audioFormats[0]?.itag,
     });
 
   } catch (err) {
     console.error('[INFO ERROR]', err.message);
-
-    if (err.message?.includes('private')) {
+    if (err.message?.includes('private'))
       return res.status(403).json({ error: 'This video is private.' });
-    }
-    if (err.message?.includes('age')) {
-      return res.status(403).json({ error: 'Age-restricted video.' });
-    }
+    if (err.message?.includes('429'))
+      return res.status(429).json({ error: 'YouTube is rate limiting this server. Please add cookies (see README).' });
     res.status(500).json({ error: 'Could not fetch video info. ' + err.message });
   }
 });
