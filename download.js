@@ -1,128 +1,102 @@
-const express  = require('express');
-const ytdl     = require('@distube/ytdl-core');
-const ffmpeg   = require('fluent-ffmpeg');
-const fetch    = require('node-fetch');
-const sanitize = require('sanitize-filename');
-const os       = require('os');
-const fs       = require('fs');
-const path     = require('path');
-const router   = express.Router();
+const express   = require('express');
+const { spawn } = require('child_process');
+const sanitize  = require('sanitize-filename');
+const path      = require('path');
+const fs        = require('fs');
+const router    = express.Router();
 
-/* ── Load cookies (same fix: use process.cwd()) ── */
-function getAgent() {
-  try {
-    const cookiePath = path.join(process.cwd(), 'cookies.json');
-    if (fs.existsSync(cookiePath)) {
-      const cookies = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
-      if (Array.isArray(cookies) && cookies.length > 0)
-        return ytdl.createAgent(cookies);
-    }
-  } catch (e) {
-    console.error('[COOKIES] Error:', e.message);
-  }
-  return undefined;
+const COOKIES = path.join(process.cwd(), 'cookies.txt');
+
+function cookieArgs() {
+  return fs.existsSync(COOKIES) ? ['--cookies', COOKIES] : [];
 }
 
-async function downloadThumbnail(url) {
-  try {
-    const res = await fetch(url);
-    const buf = await res.buffer();
-    const tmp = path.join(os.tmpdir(), `thumb_${Date.now()}.jpg`);
-    fs.writeFileSync(tmp, buf);
-    return tmp;
-  } catch { return null; }
+function safeFile(title, ext) {
+  return sanitize(title || 'download').replace(/\s+/g,'_').slice(0,80) + '.' + ext;
 }
 
-function safeFilename(title, ext) {
-  return sanitize(title).replace(/\s+/g,'_').substring(0,100) + '.' + ext;
-}
-
-async function handleMp3(req, res) {
+/* ── MP3 ─────────────────────────────────────────── */
+function handleMp3(req, res) {
   const { url } = req.query;
-  if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid URL' });
+  if (!url) return res.status(400).json({ error: 'Missing url' });
 
-  const agent = getAgent();
-  let info;
-  try {
-    info = await ytdl.getInfo(url, agent ? { agent } : {});
-  } catch (err) {
-    return res.status(500).json({ error: 'Could not fetch video: ' + err.message });
-  }
+  const tmp  = `/tmp/ytf_${Date.now()}`;
+  const args = [
+    ...cookieArgs(),
+    '--no-playlist', '--no-warnings',
+    '-f', 'bestaudio',
+    '-x', '--audio-format', 'mp3', '--audio-quality', '0',
+    '--embed-thumbnail', '--add-metadata',
+    '-o', `${tmp}.%(ext)s`,
+    url,
+  ];
 
-  const { videoDetails } = info;
-  const thumbPath = videoDetails.thumbnails?.at(-1)?.url
-    ? await downloadThumbnail(videoDetails.thumbnails.at(-1).url)
-    : null;
+  console.log('[MP3] yt-dlp', args.join(' '));
+  const proc = spawn('yt-dlp', args);
+  let errOut = '';
+  proc.stderr.on('data', d => { errOut += d; process.stderr.write(d); });
 
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename(videoDetails.title,'mp3')}"`);
-  res.setHeader('Content-Type', 'audio/mpeg');
-
-  const audioStream = ytdl(url, { quality:'highestaudio', filter:'audioonly', ...(agent?{agent}:{}) });
-  audioStream.on('error', err => { console.error('[YTDL]',err.message); if(!res.headersSent) res.status(500).end(); });
-
-  const cmd = ffmpeg(audioStream)
-    .audioBitrate(320).audioCodec('libmp3lame').format('mp3')
-    .outputOptions([
-      '-metadata', `title=${videoDetails.title}`,
-      '-metadata', `artist=${videoDetails.author?.name||'Unknown'}`,
-      '-metadata', `album=YouTube Downloads`,
-    ]);
-
-  if (thumbPath) {
-    cmd.input(thumbPath).outputOptions([
-      '-map','0:a','-map','1:v',
-      '-id3v2_version','3',
-      '-metadata:s:v','title=Album cover',
-      '-metadata:s:v','comment=Cover (front)',
-      '-c:v','copy',
-    ]);
-  }
-
-  cmd
-    .on('error', err => { console.error('[FFMPEG]',err.message); if(!res.headersSent) res.status(500).end(); if(thumbPath) fs.unlink(thumbPath,()=>{}); })
-    .on('end', () => { if(thumbPath) fs.unlink(thumbPath,()=>{}); })
-    .pipe(res, { end: true });
+  proc.on('close', code => {
+    if (code !== 0) {
+      if (!res.headersSent)
+        res.status(500).json({ error: 'yt-dlp failed: ' + errOut.slice(0,200) });
+      return;
+    }
+    const file = [`${tmp}.mp3`,`${tmp}.m4a`,`${tmp}.opus`].find(f => fs.existsSync(f));
+    if (!file) return res.status(500).json({ error: 'Output file missing.' });
+    res.setHeader('Content-Disposition','attachment; filename="ytflow.mp3"');
+    res.setHeader('Content-Type','audio/mpeg');
+    res.setHeader('Content-Length', fs.statSync(file).size);
+    const s = fs.createReadStream(file);
+    s.pipe(res);
+    s.on('close', () => fs.unlink(file, ()=>{}));
+  });
+  req.on('close', () => proc.kill());
 }
 
-async function handleMp4(req, res) {
-  const { url, itag, quality } = req.query;
-  if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid URL' });
+/* ── MP4 ─────────────────────────────────────────── */
+function handleMp4(req, res) {
+  const { url, quality } = req.query;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
 
-  const agent = getAgent();
-  let info;
-  try {
-    info = await ytdl.getInfo(url, agent ? { agent } : {});
-  } catch (err) {
-    return res.status(500).json({ error: 'Could not fetch video: ' + err.message });
-  }
+  const h   = parseInt(quality) || 1080;
+  const tmp = `/tmp/ytf_${Date.now()}`;
+  const fmt = `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
 
-  const { videoDetails, formats } = info;
-  const fmt = itag
-    ? formats.find(f => f.itag === parseInt(itag))
-    : ytdl.chooseFormat(formats, { quality:'highest', filter:'audioandvideo' });
+  const args = [
+    ...cookieArgs(),
+    '--no-playlist', '--no-warnings',
+    '-f', fmt,
+    '--merge-output-format', 'mp4',
+    '-o', `${tmp}.%(ext)s`,
+    url,
+  ];
 
-  if (!fmt) return res.status(404).json({ error: 'Format not available.' });
+  console.log('[MP4] yt-dlp', args.join(' '));
+  const proc = spawn('yt-dlp', args);
+  let errOut = '';
+  proc.stderr.on('data', d => { errOut += d; process.stderr.write(d); });
 
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename(`${videoDetails.title}${quality?'_'+quality:''}`, 'mp4')}"`);
-  res.setHeader('Content-Type', 'video/mp4');
-
-  if (fmt.hasAudio && fmt.hasVideo) {
-    ytdl(url, { format:fmt, ...(agent?{agent}:{}) })
-      .on('error', err => { console.error('[YTDL]',err.message); if(!res.headersSent) res.status(500).end(); })
-      .pipe(res);
-  } else {
-    const vStream = ytdl(url, { format:fmt, ...(agent?{agent}:{}) });
-    const aStream = ytdl(url, { quality:'highestaudio', filter:'audioonly', ...(agent?{agent}:{}) });
-    ffmpeg()
-      .input(vStream).input(aStream)
-      .outputOptions(['-map','0:v','-map','1:a','-c:v','copy','-c:a','aac','-movflags','frag_keyframe+empty_moov'])
-      .format('mp4')
-      .on('error', err => { console.error('[FFMPEG]',err.message); if(!res.headersSent) res.status(500).end(); })
-      .pipe(res, { end:true });
-  }
+  proc.on('close', code => {
+    if (code !== 0) {
+      if (!res.headersSent)
+        res.status(500).json({ error: 'yt-dlp failed: ' + errOut.slice(0,200) });
+      return;
+    }
+    const file = [`${tmp}.mp4`,`${tmp}.mkv`,`${tmp}.webm`].find(f => fs.existsSync(f));
+    if (!file) return res.status(500).json({ error: 'Output file missing.' });
+    const label = quality ? `_${quality}` : '';
+    res.setHeader('Content-Disposition',`attachment; filename="ytflow${label}.mp4"`);
+    res.setHeader('Content-Type','video/mp4');
+    res.setHeader('Content-Length', fs.statSync(file).size);
+    const s = fs.createReadStream(file);
+    s.pipe(res);
+    s.on('close', () => fs.unlink(file, ()=>{}));
+  });
+  req.on('close', () => proc.kill());
 }
 
-router.get('/', async (req, res) => {
+router.get('/', (req, res) => {
   const { type } = req.query;
   if (type === 'mp3') return handleMp3(req, res);
   if (type === 'mp4') return handleMp4(req, res);
