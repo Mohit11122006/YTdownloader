@@ -9,7 +9,10 @@ FROM node:18-alpine
 # Install FFmpeg (required for audio conversion + video merging)
 RUN apk add --no-cache ffmpeg python3 make g++
 
-# Set working directory
+# Copy frontend to /frontend (Express serves it from ../frontend relative to /app)
+COPY frontend/ /frontend/
+
+# Set working directory for backend
 WORKDIR /app
 
 # Copy and install backend dependencies first (layer caching)
@@ -19,11 +22,8 @@ RUN npm install --production
 # Copy backend source
 COPY backend/ ./
 
-# Copy frontend (served statically by Express)
-COPY frontend/ ../frontend/
-
 # Expose port
-EXPOSE 3001
+EXPOSE 10000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s \
